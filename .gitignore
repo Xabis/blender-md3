@@ -1,2 +1,12 @@
 *.pyc
-__pycache__
+__pycache__/
+*.md3
+/*.blend*
+/tests/*.blend?*
+*.png
+/*.zip
+/models/
+/bugs/
+/.pytest_cache/
+/result.txt
+/blender-*/
