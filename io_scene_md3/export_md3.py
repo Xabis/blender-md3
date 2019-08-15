@@ -9,6 +9,7 @@ from math import sqrt
 
 import bpy
 import mathutils
+import operator
 
 from . import fmt_md3 as fmt
 from .utils import OffsetBytesIO
@@ -21,35 +22,20 @@ def prepare_name(name):
         return name[:-4]  # cut off blender's .001 .002 etc
     return name
 
-
 def gather_shader_info(mesh):
-    'Returning uvmap name, texture name list'
-    uv_maps = {}
-    for material in mesh.materials:
-        for texture_slot in material.texture_slots:
-            if (
-                texture_slot is None
-                or not texture_slot.use
-                or not texture_slot.uv_layer
-                or texture_slot.texture_coords != 'UV' or not texture_slot.texture
-                or texture_slot.texture.type != 'IMAGE'
-            ):
-                continue
-            uv_map_name = texture_slot.uv_layer
-            if uv_map_name not in uv_maps:
-                uv_maps[uv_map_name] = []
-            # one UV map can be used by many textures
-            uv_maps[uv_map_name].append(prepare_name(texture_slot.texture.name))
-    uv_maps = [(k, v) for k, v in uv_maps.items()]
-    if len(uv_maps) <= 0:
-        print('Warning: No UV maps found, zero filling will be used')
-        return None, []
-    elif len(uv_maps) == 1:
-        return uv_maps[0]
-    else:
-        print('Warning: Multiple UV maps found, only one will be chosen')
-        return uv_maps[0]
+    #This is a placeholder. No shader info is exported currently
+    return []
 
+def get_uv_data(mesh):
+    'Return the active uv data'
+
+    #2.8 note: UV is no longer bound to the material, but directly to the object.
+    #          UV is set regardless of texture being available
+    #          Blender render is removed in 2.8; users must use cycles and assign textures using nodes.
+    #          This method supports both blender render in 2.7, and cycles in both.
+    if mesh.uv_layers.active:
+        return mesh.uv_layers.active.data, mesh.uv_layers.active.name
+    return None, None
 
 def gather_vertices(mesh, uvmap_data=None):
     md3vert_to_loop_map = []
@@ -90,6 +76,12 @@ def find_interval(vs, t):
     assert vs[a] <= t <= vs[b]
     return a, b
 
+def matmul(a, b):
+    if hasattr(bpy.app, "version") and bpy.app.version >= (2, 80):
+        return operator.matmul(a, b) #2.8: emulate a @ b
+    else:
+        return a * b                 #2.7
+
 
 class MD3Exporter:
     def __init__(self, context):
@@ -98,6 +90,19 @@ class MD3Exporter:
     @property
     def scene(self):
         return self.context.scene
+
+    def get_object_mesh(self, obj):
+        if hasattr(obj, "evaluated_get"):
+            dg = self.context.evaluated_depsgraph_get()
+            return obj.evaluated_get(dg).to_mesh()          #2.8
+        else:
+            return obj.to_mesh(self.scene, True, 'PREVIEW') #2.7
+
+    def set_active_object(self, obj):
+        if hasattr(self.context, "view_layer"):
+            self.context.view_layer.objects.active = obj    #2.8
+        else:
+            self.context.scene.objects.active = obj         #2.7
 
     def pack_tag(self, name):
         tag = self.scene.objects[name]
@@ -140,7 +145,7 @@ class MD3Exporter:
             a, b, t = self.mesh_sk_abs
             co = interp(kbs[a].data[i].co, kbs[b].data[i].co, t)
 
-        co = self.mesh_matrix * co
+        co = matmul(self.mesh_matrix, co)
         self.mesh_vco[frame].append(co)
         return co
 
@@ -152,11 +157,11 @@ class MD3Exporter:
             normal=tuple(self.mesh.loops[loop_id].normal))
 
     def pack_surface_ST(self, i):
-        if self.mesh_uvmap_name is None:
+        if self.mesh_uvmap_data is None:
             s, t = 0.0, 0.0
         else:
             loop_idx = self.mesh_md3vert_to_loop[i]
-            s, t = self.mesh.uv_layers[self.mesh_uvmap_name].data[loop_idx].uv
+            s, t = self.mesh_uvmap_data[loop_idx].uv
         return fmt.TexCoord.pack(s, t)
 
     def switch_frame(self, i):
@@ -165,9 +170,13 @@ class MD3Exporter:
     def surface_start_frame(self, i):
         self.switch_frame(i)
 
-        obj = self.scene.objects.active
+        if hasattr(self.context, "view_layer"):
+            obj = self.context.view_layer.objects.active #2.8
+        else:
+            obj = self.context.scene.objects.active      #2.7
+        
         self.mesh_matrix = obj.matrix_world
-        self.mesh = obj.to_mesh(self.scene, True, 'PREVIEW')
+        self.mesh = self.get_object_mesh(obj)
         self.mesh.calc_normals_split()
 
         self.mesh_sk_rel = None
@@ -190,15 +199,16 @@ class MD3Exporter:
 
     def pack_surface(self, surf_name):
         obj = self.scene.objects[surf_name]
-        self.scene.objects.active = obj
+        self.set_active_object(obj)
         bpy.ops.object.modifier_add(type='TRIANGULATE')  # no 4-gons or n-gons
-        self.mesh = obj.to_mesh(self.scene, True, 'PREVIEW')
+        self.mesh = self.get_object_mesh(obj)
         self.mesh.calc_normals_split()
 
-        self.mesh_uvmap_name, self.mesh_shader_list = gather_shader_info(self.mesh)
+        self.mesh_uvmap_data, uvmap_name = get_uv_data(self.mesh)
+        self.mesh_shader_list = gather_shader_info(self.mesh)
         self.mesh_md3vert_to_loop, self.mesh_loop_to_md3vert = gather_vertices(
             self.mesh,
-            None if self.mesh_uvmap_name is None else self.mesh.uv_layers[self.mesh_uvmap_name].data)
+            self.mesh_uvmap_data)
 
         nShaders = len(self.mesh_shader_list)
         nVerts = len(self.mesh_md3vert_to_loop)
@@ -227,8 +237,9 @@ class MD3Exporter:
         # release here, to_mesh used for every frame
         bpy.ops.object.modifier_remove(modifier=obj.modifiers[-1].name)
 
-        print('Surface {}: nVerts={}{} nTris={}{} nShaders={}{}'.format(
+        print('Surface {}: map={} nVerts={}{} nTris={}{} nShaders={}{}'.format(
             surf_name,
+            uvmap_name,
             nVerts, ' (Too many!)' if nVerts > 4096 else '',
             nTris, ' (Too many!)' if nTris > 8192 else '',
             nShaders, ' (Too many!)' if nShaders > 256 else '',
@@ -283,8 +294,12 @@ class MD3Exporter:
         self.surfNames = []
         self.tagNames = []
         for o in self.scene.objects:
-            if o.hide:  # skip hidden objects
+            # skip hidden objects
+            if hasattr(o, "hide_viewport") and o.hide_viewport:  #2.8
                 continue
+            elif hasattr(o, "hide") and o.hide:                  #2.7
+                continue
+
             if o.type == 'MESH':
                 self.surfNames.append(o.name)
             elif o.type == 'EMPTY' and o.empty_draw_type == 'ARROWS':
@@ -320,4 +335,4 @@ class MD3Exporter:
                 **f.getoffsets()
             ))
             file.write(f.getvalue())
-            print('nFrames={} nSurfaces={}'.format(self.nFrames, len(surfaces_bin)))
+            print('MD3: nFrames={} nSurfaces={}'.format(self.nFrames, len(surfaces_bin)))
